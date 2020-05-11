@@ -125,6 +125,7 @@ public:
     bool pedantic = false;
     bool allowAsserts = false;
     bool emscripten = false;
+    bool metal = true;
     bool deterministic = false;
     std::string symbolsFile;
   };
@@ -2081,8 +2082,10 @@ private:
   Name moduleName;
 
   void emitPreEmscripten();
+  void emitPreMetal();
   void emitPreES6();
   void emitPostEmscripten();
+  void emitPostMetal();
   void emitPostES6();
 
   void emitMemory(std::string buffer,
@@ -2094,6 +2097,8 @@ private:
 void Wasm2JSGlue::emitPre() {
   if (flags.emscripten) {
     emitPreEmscripten();
+  } else if (flags.metal) {
+	  emitPreMetal();
   } else {
     emitPreES6();
   }
@@ -2103,6 +2108,42 @@ void Wasm2JSGlue::emitPre() {
 
 void Wasm2JSGlue::emitPreEmscripten() {
   out << "function instantiate(asmLibraryArg, wasmMemory, wasmTable) {\n\n";
+}
+
+void Wasm2JSGlue::emitPreMetal() {
+  std::unordered_map<Name, Name> baseModuleMap;
+  out << "(function() {\n";
+
+  auto noteImport = [&](Name module, Name base) {
+    // Right now codegen requires a flat namespace going into the module,
+    // meaning we don't support importing the same name from multiple namespaces
+    // yet.
+    if (baseModuleMap.count(base) && baseModuleMap[base] != module) {
+      Fatal() << "the name " << base << " cannot be imported from "
+              << "two different modules yet\n";
+      abort();
+    }
+    baseModuleMap[base] = module;
+
+    out << "const " << asmangle(base.str) << " = "
+	    << "window[METAL_IMPORT]."
+	    << asmangle(base.str) << ";\n";
+  };
+
+  ImportInfo imports(wasm);
+
+  ModuleUtils::iterImportedGlobals(
+    wasm, [&](Global* import) { noteImport(import->module, import->base); });
+  ModuleUtils::iterImportedFunctions(wasm, [&](Function* import) {
+    // The scratch memory helpers are emitted in the glue, see code and comments
+    // below.
+    if (ABI::wasm2js::isScratchMemoryHelper(import->base)) {
+      return;
+    }
+    noteImport(import->module, import->base);
+  });
+
+  out << "\n";
 }
 
 void Wasm2JSGlue::emitPreES6() {
@@ -2146,6 +2187,8 @@ void Wasm2JSGlue::emitPreES6() {
 void Wasm2JSGlue::emitPost() {
   if (flags.emscripten) {
     emitPostEmscripten();
+  } else if (flags.metal) {
+    emitPostMetal();
   } else {
     emitPostES6();
   }
@@ -2175,6 +2218,74 @@ void Wasm2JSGlue::emitPostEmscripten() {
       << "\n"
       << "\n"
       << "}";
+}
+
+void Wasm2JSGlue::emitPostMetal() {
+  // Create an initial `ArrayBuffer` and populate it with static data.
+  // Currently we use base64 encoding to encode static data and we decode it at
+  // instantiation time.
+  //
+  // Note that the translation here expects that the lower values of this memory
+  // can be used for conversions, so make sure there's at least one page.
+  {
+    auto pages = wasm.memory.initial == 0 ? 1 : wasm.memory.initial.addr;
+    out << "var mem" << moduleName.str << " = new ArrayBuffer("
+        << pages * Memory::kPageSize << ");\n";
+  }
+
+  emitMemory(std::string("mem") + moduleName.str,
+             std::string("assign") + moduleName.str,
+             [](std::string globalName) { return globalName; });
+
+  // Actually invoke the `asmFunc` generated function, passing in all global
+  // values followed by all imports
+  out << "var ret" << moduleName.str << " = " << moduleName.str << "({"
+      << "Math: Math,"
+      << "Int8Array: Int8Array,"
+      << "Uint8Array: Uint8Array,"
+      << "Int16Array: Int16Array,"
+      << "Uint16Array: Uint16Array,"
+      << "Int32Array: Int32Array,"
+      << "Uint32Array: Uint32Array,"
+      << "Float32Array: Float32Array,"
+      << "Float64Array: Float64Array,"
+      << "NaN: NaN,"
+      << "Infinity: Infinity"
+      << "}, {";
+
+  out << "abort:function() { throw new Error('abort'); }";
+
+  ModuleUtils::iterImportedFunctions(wasm, [&](Function* import) {
+    // The scratch memory helpers are emitted in the glue, see code and comments
+    // below.
+    if (ABI::wasm2js::isScratchMemoryHelper(import->base)) {
+      return;
+    }
+    out << "," << asmangle(import->base.str) << ": " <<  asmangle(import->base.str);
+  });
+  out << "},mem" << moduleName.str << ");\n";
+
+  if (flags.allowAsserts) {
+    return;
+  }
+
+  out << "window[METAL_NAME] = {};\n";
+
+  for (auto& exp : wasm.exports) {
+    switch (exp->kind) {
+      case ExternalKind::Function:
+      case ExternalKind::Memory:
+        break;
+      default:
+        continue;
+    }
+    out << "window[METAL_NAME]."
+	    << asmangle(exp->name.str) << " = ret"
+	    << moduleName.str << "."
+	    << asmangle(exp->name.str) << ";\n";
+
+  }
+  out << "})();\n";
 }
 
 void Wasm2JSGlue::emitPostES6() {
