@@ -2126,7 +2126,7 @@ void Wasm2JSGlue::emitPreMetal() {
     baseModuleMap[base] = module;
 
     out << "const " << asmangle(base.str) << " = "
-	    << "window[METAL_IMPORT]."
+	    << "globalThis[METAL_IMPORT]."
 	    << asmangle(base.str) << ";\n";
   };
 
@@ -2269,7 +2269,7 @@ void Wasm2JSGlue::emitPostMetal() {
     return;
   }
 
-  out << "window[METAL_NAME] = {};\n";
+  out << "globalThis[METAL_NAME] = {};\n";
 
   for (auto& exp : wasm.exports) {
     switch (exp->kind) {
@@ -2279,7 +2279,7 @@ void Wasm2JSGlue::emitPostMetal() {
       default:
         continue;
     }
-    out << "window[METAL_NAME]."
+    out << "globalThis[METAL_NAME]."
 	    << asmangle(exp->name.str) << " = ret"
 	    << moduleName.str << "."
 	    << asmangle(exp->name.str) << ";\n";
